@@ -1,0 +1,356 @@
+--- qcom_battmgr.c.ubuntu_orig	2026-03-14 13:29:10.227558283 -0500
++++ qcom_battmgr.c	2026-03-14 13:45:51.930109286 -0500
+@@ -13,6 +13,18 @@
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
+ #include <linux/units.h>
++#include <linux/workqueue.h>
++
++/*
++ * USB PD input current limit in microamps to request from firmware.
++ * The firmware should clamp to whatever the charger actually supports.
++ * 5000000 uA (5A) at 20V = 100W (USB PD 3.0 max).
++ * Set to 0 to disable automatic current limit override.
++ */
++static unsigned int pd_current_limit_ua = 5000000;
++module_param(pd_current_limit_ua, uint, 0644);
++MODULE_PARM_DESC(pd_current_limit_ua,
++		 "USB PD input current limit in uA (default 5000000 = 5A/100W). Set 0 to disable.");
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
+@@ -20,6 +32,7 @@
+ enum qcom_battmgr_variant {
+ 	QCOM_BATTMGR_SM8350,
+ 	QCOM_BATTMGR_SC8280XP,
++	QCOM_BATTMGR_X1E80100,
+ };
+ 
+ #define BATTMGR_BAT_STATUS		0x1
+@@ -306,6 +319,8 @@
+ 	struct qcom_battmgr_wireless wireless;
+ 
+ 	struct work_struct enable_work;
++	struct delayed_work pd_current_work;
++	bool pd_current_set;
+ 
+ 	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+@@ -373,6 +388,79 @@
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
++/*
++ * USB adapter type values used by Qualcomm firmware.
++ * These are not standardized — derived from downstream Qualcomm kernel sources.
++ */
++#define USB_ADAP_TYPE_DCP	4	/* Dedicated Charging Port */
++#define USB_ADAP_TYPE_PD	14	/* USB Power Delivery */
++
++static void qcom_battmgr_pd_current_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr =
++		container_of(work, struct qcom_battmgr, pd_current_work.work);
++	int ret;
++
++	if (!battmgr->service_up || !pd_current_limit_ua || battmgr->pd_current_set)
++		return;
++
++	battmgr->pd_current_set = true;
++
++	dev_info(battmgr->dev, "configuring USB PD charging parameters\n");
++
++	/*
++	 * Try setting adapter type to PD first — this may unlock
++	 * fast charging in the firmware's charger classification.
++	 */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_SET,
++					     USB_ADAP_TYPE,
++					     USB_ADAP_TYPE_PD);
++	mutex_unlock(&battmgr->lock);
++	dev_info(battmgr->dev, "set USB_ADAP_TYPE=PD(%d): %s\n",
++		 USB_ADAP_TYPE_PD, ret ? "FAILED" : "ok");
++
++	/* Set USB type to PD (POWER_SUPPLY_USB_TYPE_PD = 6 in some firmwares) */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_SET,
++					     USB_TYPE, 6);
++	mutex_unlock(&battmgr->lock);
++	dev_info(battmgr->dev, "set USB_TYPE=PD(6): %s\n",
++		 ret ? "FAILED" : "ok");
++
++	/* Set the maximum current */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_SET,
++					     USB_CURR_MAX,
++					     pd_current_limit_ua);
++	mutex_unlock(&battmgr->lock);
++	dev_info(battmgr->dev, "set USB_CURR_MAX=%u uA: %s\n",
++		 pd_current_limit_ua, ret ? "FAILED" : "ok");
++
++	/* Set input current limit */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_SET,
++					     USB_INPUT_CURR_LIMIT,
++					     pd_current_limit_ua);
++	mutex_unlock(&battmgr->lock);
++	dev_info(battmgr->dev, "set USB_INPUT_CURR_LIMIT=%u uA: %s\n",
++		 pd_current_limit_ua, ret ? "FAILED" : "ok");
++
++	/* Set voltage max to 20V (PD max for non-EPR) */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_SET,
++					     USB_VOLT_MAX,
++					     20000000);
++	mutex_unlock(&battmgr->lock);
++	dev_info(battmgr->dev, "set USB_VOLT_MAX=20V: %s\n",
++		 ret ? "FAILED" : "ok");
++}
++
+ static int qcom_battmgr_update_charge_time(struct qcom_battmgr *battmgr)
+ {
+ 	struct qcom_battmgr_charge_time_request request = {
+@@ -489,7 +577,8 @@
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
++	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+ 	else
+ 		ret = qcom_battmgr_bat_sm8350_update(battmgr, psp);
+@@ -754,12 +843,27 @@
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
++	if (battmgr->variant == QCOM_BATTMGR_X1E80100) {
++		/*
++		 * X1E80100: get charging_source from SC8280XP-style battery
++		 * status first (for ONLINE), then try individual USB property
++		 * queries for extended properties. The firmware may return 0
++		 * for individual queries, so don't fail on those.
++		 */
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+-	else
++		if (ret)
++			return ret;
++		if (psp != POWER_SUPPLY_PROP_ONLINE)
++			qcom_battmgr_usb_sm8350_update(battmgr, psp);
++	} else if (battmgr->variant == QCOM_BATTMGR_SC8280XP) {
++		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
++		if (ret)
++			return ret;
++	} else {
+ 		ret = qcom_battmgr_usb_sm8350_update(battmgr, psp);
+-	if (ret)
+-		return ret;
++		if (ret)
++			return ret;
++	}
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_ONLINE:
+@@ -812,6 +916,73 @@
+ 		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
+ };
+ 
++static int qcom_battmgr_usb_set_property(struct power_supply *psy,
++					 enum power_supply_property psp,
++					 const union power_supply_propval *pval)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	int ret;
++
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_USB_PROPERTY_SET,
++						    USB_INPUT_CURR_LIMIT,
++						    pval->intval);
++		mutex_unlock(&battmgr->lock);
++		if (!ret)
++			battmgr->usb.current_limit = pval->intval;
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int qcom_battmgr_usb_is_writeable(struct power_supply *psy,
++					  enum power_supply_property psp)
++{
++	switch (psp) {
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static const enum power_supply_property x1e80100_usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_USB_TYPE,
++};
++
++static const struct power_supply_desc x1e80100_usb_psy_desc = {
++	.name = "qcom-battmgr-usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = x1e80100_usb_props,
++	.num_properties = ARRAY_SIZE(x1e80100_usb_props),
++	.get_property = qcom_battmgr_usb_get_property,
++	.set_property = qcom_battmgr_usb_set_property,
++	.property_is_writeable = qcom_battmgr_usb_is_writeable,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
++		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_CDP)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_ACA)     |
++		     BIT(POWER_SUPPLY_USB_TYPE_C)       |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD)      |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD_DRP)  |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS)  |
++		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
++};
++
+ static const enum power_supply_property sm8350_usb_props[] = {
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+@@ -876,7 +1047,8 @@
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
++	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+ 	else
+ 		ret = qcom_battmgr_wls_sm8350_update(battmgr, psp);
+@@ -1068,6 +1240,20 @@
+ 		battmgr->ac.online = source == BATTMGR_CHARGING_SOURCE_AC;
+ 		battmgr->usb.online = source == BATTMGR_CHARGING_SOURCE_USB;
+ 		battmgr->wireless.online = source == BATTMGR_CHARGING_SOURCE_WIRELESS;
++
++		/*
++		 * On X1E80100, when USB charging is detected, try to
++		 * configure PD charging parameters. Only do this once
++		 * per plug event.
++		 */
++		if (battmgr->variant == QCOM_BATTMGR_X1E80100) {
++			if (source == BATTMGR_CHARGING_SOURCE_USB &&
++			    !battmgr->pd_current_set)
++				schedule_delayed_work(&battmgr->pd_current_work,
++						      msecs_to_jiffies(1000));
++			else if (source != BATTMGR_CHARGING_SOURCE_USB)
++				battmgr->pd_current_set = false;
++		}
+ 		if (battmgr->info.last_full_capacity != 0) {
+ 			/*
+ 			 * 100 * battmgr->status.capacity can overflow a 32bit
+@@ -1283,8 +1469,13 @@
+ 			break;
+ 		}
+ 		break;
++	case BATTMGR_USB_PROPERTY_SET:
++	case BATTMGR_WLS_PROPERTY_SET:
+ 	case BATTMGR_REQUEST_NOTIFICATION:
+-		battmgr->error = 0;
++		if (payload_len >= sizeof(resp->intval))
++			battmgr->error = le32_to_cpu(resp->intval.result);
++		else
++			battmgr->error = 0;
+ 		break;
+ 	default:
+ 		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
+@@ -1301,12 +1492,26 @@
+ 	struct qcom_battmgr *battmgr = priv;
+ 	unsigned int opcode = le32_to_cpu(hdr->opcode);
+ 
+-	if (opcode == BATTMGR_NOTIFICATION)
++	if (opcode == BATTMGR_NOTIFICATION) {
+ 		qcom_battmgr_notification(battmgr, data, len);
+-	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
++	} else if (battmgr->variant == QCOM_BATTMGR_X1E80100) {
++		/*
++		 * X1E80100 uses SC8280XP-style battery status notifications
++		 * but SM8350-style individual USB/WLS property queries.
++		 * Route based on opcode.
++		 */
++		if (opcode == BATTMGR_USB_PROPERTY_GET ||
++		    opcode == BATTMGR_USB_PROPERTY_SET ||
++		    opcode == BATTMGR_WLS_PROPERTY_GET ||
++		    opcode == BATTMGR_WLS_PROPERTY_SET)
++			qcom_battmgr_sm8350_callback(battmgr, data, len);
++		else
++			qcom_battmgr_sc8280xp_callback(battmgr, data, len);
++	} else if (battmgr->variant == QCOM_BATTMGR_SC8280XP) {
+ 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
+-	else
++	} else {
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
++	}
+ }
+ 
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+@@ -1339,7 +1544,7 @@
+ static const struct of_device_id qcom_battmgr_of_variants[] = {
+ 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
+ 	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
+-	{ .compatible = "qcom,x1e80100-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
++	{ .compatible = "qcom,x1e80100-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
+ 	/* Unmatched devices falls back to QCOM_BATTMGR_SM8350 */
+ 	{}
+ };
+@@ -1370,6 +1575,7 @@
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
+ 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
++	INIT_DELAYED_WORK(&battmgr->pd_current_work, qcom_battmgr_pd_current_worker);
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
+ 
+@@ -1379,7 +1585,27 @@
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
+ 
+-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP) {
++	if (battmgr->variant == QCOM_BATTMGR_X1E80100) {
++		battmgr->bat_psy = devm_power_supply_register(dev, &sc8280xp_bat_psy_desc, &psy_cfg);
++		if (IS_ERR(battmgr->bat_psy))
++			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
++					     "failed to register battery power supply\n");
++
++		battmgr->ac_psy = devm_power_supply_register(dev, &sc8280xp_ac_psy_desc, &psy_cfg_supply);
++		if (IS_ERR(battmgr->ac_psy))
++			return dev_err_probe(dev, PTR_ERR(battmgr->ac_psy),
++					     "failed to register AC power supply\n");
++
++		battmgr->usb_psy = devm_power_supply_register(dev, &x1e80100_usb_psy_desc, &psy_cfg_supply);
++		if (IS_ERR(battmgr->usb_psy))
++			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
++					     "failed to register USB power supply\n");
++
++		battmgr->wls_psy = devm_power_supply_register(dev, &sc8280xp_wls_psy_desc, &psy_cfg_supply);
++		if (IS_ERR(battmgr->wls_psy))
++			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
++					     "failed to register wireless charing power supply\n");
++	} else if (battmgr->variant == QCOM_BATTMGR_SC8280XP) {
+ 		battmgr->bat_psy = devm_power_supply_register(dev, &sc8280xp_bat_psy_desc, &psy_cfg);
+ 		if (IS_ERR(battmgr->bat_psy))
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
