@@ -1,6 +1,6 @@
 # x1e80100 USB PD Charging Fix for Linux
 
-**Fix for extremely slow USB-C Power Delivery charging on Qualcomm Snapdragon X Elite (X1E80100) laptops running Linux.** Increases charging from ~12W to the full 60W PD contract.
+**Fix for extremely slow USB-C Power Delivery charging on Qualcomm Snapdragon X Elite (X1E80100) laptops running Linux.** Increases charging from ~12W to 60W+ (5x improvement).
 
 > Tested on **ASUS Vivobook S 15 / Vivobook S Plus X Elite (S5507QA)** — should work on any X1E80100 laptop including Dell Latitude 7455, Lenovo ThinkPad T14s Gen 6, HP EliteBook Ultra, Samsung Galaxy Book4 Edge, and other Snapdragon X Elite / X Plus devices.
 
@@ -42,12 +42,13 @@ This patch creates a dedicated `QCOM_BATTMGR_X1E80100` variant that:
 
 | | Before | After |
 |---|--------|-------|
-| Battery charging power | ~12W | ~37W |
+| Battery charging power | ~12W | ~61W |
+| UCSI current draw | 2.5A | 4.3A |
 | USB type reported | Unknown | PD |
-| Charger input power | ~15W | ~60W (PD contract) |
-| Time to full (70Wh battery) | ~6 hours | ~2 hours |
+| Charger input power | ~15W | ~86W (20V × 4.3A) |
+| Time to full (70Wh battery) | ~6 hours | ~1.2 hours |
 
-The ~37W to battery represents the full 60W PD contract minus system power draw (~15W) and conversion losses.
+Tested with a 100W USB-C PD charger. The firmware properly renegotiates the PD contract to draw up to 4.3A at 20V after the patch configures adapter type and current limits.
 
 ## Tested On
 
@@ -90,6 +91,8 @@ make
 
 ### Install
 
+> **IMPORTANT: A full reboot is REQUIRED after installation.** The PD charging parameters must be configured during a fresh boot — the firmware ignores them if set after the PD session is already established. Hot-reloading the module with `modprobe -r && modprobe` will NOT work. You must reboot (or fully power off and back on) for the fix to take effect.
+
 ```bash
 # Backup original module
 sudo cp /lib/modules/$(uname -r)/kernel/drivers/power/supply/qcom_battmgr.ko.zst \
@@ -103,7 +106,7 @@ sudo zstd qcom_battmgr.ko \
 sudo depmod -a
 sudo update-initramfs -u
 
-# Reboot for clean PD negotiation
+# REBOOT IS REQUIRED — hot-reload will NOT work
 sudo reboot
 ```
 
@@ -191,8 +194,7 @@ This patch:
 
 ### Limitations
 
-- **60W PD sink cap**: The laptop's UCSI firmware advertises a 3A sink capability, limiting the PD contract to 20V/3A = 60W regardless of charger wattage. This is a firmware limitation that cannot be changed through GLINK.
-- **Cold boot required**: The PD configuration must happen during a fresh boot. Hot-reloading the module (`modprobe -r && modprobe`) won't renegotiate the PD session.
+- **Reboot required**: The PD charging parameters **must** be configured during a fresh boot. The firmware locks its charger classification early in the PD session and ignores changes made after that. Hot-reloading the module with `modprobe -r && modprobe` will **NOT** work — you must do a full reboot (or power off/on). This is the single most important thing to know about this fix.
 - **Kernel updates**: The module must be rebuilt after kernel updates. Consider using DKMS for automation.
 
 ## Files
