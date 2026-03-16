@@ -1257,7 +1257,7 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 			if (source == BATTMGR_CHARGING_SOURCE_USB &&
 			    !battmgr->pd_current_set)
 				schedule_delayed_work(&battmgr->pd_current_work,
-						      msecs_to_jiffies(1000));
+						      msecs_to_jiffies(5000));
 			else if (source != BATTMGR_CHARGING_SOURCE_USB)
 				battmgr->pd_current_set = false;
 		}

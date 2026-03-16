@@ -1,5 +1,5 @@
 --- qcom_battmgr.c.ubuntu_orig	2026-03-14 13:29:10.227558283 -0500
-+++ qcom_battmgr.c	2026-03-15 20:08:04.877434268 -0500
++++ qcom_battmgr.c	2026-03-15 20:34:54.008114621 -0500
 @@ -13,6 +13,18 @@
  #include <linux/soc/qcom/pmic_glink.h>
  #include <linux/math.h>
@@ -270,7 +270,7 @@
 +			if (source == BATTMGR_CHARGING_SOURCE_USB &&
 +			    !battmgr->pd_current_set)
 +				schedule_delayed_work(&battmgr->pd_current_work,
-+						      msecs_to_jiffies(1000));
++						      msecs_to_jiffies(5000));
 +			else if (source != BATTMGR_CHARGING_SOURCE_USB)
 +				battmgr->pd_current_set = false;
 +		}
