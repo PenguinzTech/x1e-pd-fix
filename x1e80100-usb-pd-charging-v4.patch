@@ -1,5 +1,5 @@
 --- qcom_battmgr.c.ubuntu_orig	2026-03-14 13:29:10.227558283 -0500
-+++ qcom_battmgr.c	2026-03-15 20:34:54.008114621 -0500
++++ qcom_battmgr.c	2026-03-15 20:41:16.142589036 -0500
 @@ -13,6 +13,18 @@
  #include <linux/soc/qcom/pmic_glink.h>
  #include <linux/math.h>
@@ -242,21 +242,7 @@
  		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
  	else
  		ret = qcom_battmgr_wls_sm8350_update(battmgr, psp);
-@@ -956,6 +1128,13 @@
- 		power_supply_changed(battmgr->bat_psy);
- 		break;
- 	case NOTIF_USB_PROPERTY:
-+		/*
-+		 * On X1E80100, a USB property change notification may indicate
-+		 * PD renegotiation (e.g. charger replug). Reset the flag so
-+		 * the next battery status update re-triggers PD configuration.
-+		 */
-+		if (battmgr->variant == QCOM_BATTMGR_X1E80100)
-+			battmgr->pd_current_set = false;
- 		power_supply_changed(battmgr->usb_psy);
- 		break;
- 	case NOTIF_WLS_PROPERTY:
-@@ -1068,6 +1247,20 @@
+@@ -1068,6 +1240,20 @@
  		battmgr->ac.online = source == BATTMGR_CHARGING_SOURCE_AC;
  		battmgr->usb.online = source == BATTMGR_CHARGING_SOURCE_USB;
  		battmgr->wireless.online = source == BATTMGR_CHARGING_SOURCE_WIRELESS;
@@ -277,7 +263,7 @@
  		if (battmgr->info.last_full_capacity != 0) {
  			/*
  			 * 100 * battmgr->status.capacity can overflow a 32bit
-@@ -1283,8 +1476,13 @@
+@@ -1283,8 +1469,13 @@
  			break;
  		}
  		break;
@@ -292,7 +278,7 @@
  		break;
  	default:
  		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
-@@ -1301,12 +1499,26 @@
+@@ -1301,12 +1492,26 @@
  	struct qcom_battmgr *battmgr = priv;
  	unsigned int opcode = le32_to_cpu(hdr->opcode);
  
@@ -322,7 +308,7 @@
  }
  
  static void qcom_battmgr_enable_worker(struct work_struct *work)
-@@ -1339,7 +1551,7 @@
+@@ -1339,7 +1544,7 @@
  static const struct of_device_id qcom_battmgr_of_variants[] = {
  	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
  	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
@@ -331,7 +317,7 @@
  	/* Unmatched devices falls back to QCOM_BATTMGR_SM8350 */
  	{}
  };
-@@ -1370,6 +1582,7 @@
+@@ -1370,6 +1575,7 @@
  	psy_cfg_supply.num_supplicants = 1;
  
  	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
@@ -339,7 +325,7 @@
  	mutex_init(&battmgr->lock);
  	init_completion(&battmgr->ack);
  
-@@ -1379,7 +1592,27 @@
+@@ -1379,7 +1585,27 @@
  	else
  		battmgr->variant = QCOM_BATTMGR_SM8350;
  

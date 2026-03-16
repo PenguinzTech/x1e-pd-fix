@@ -1128,13 +1128,6 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		power_supply_changed(battmgr->bat_psy);
 		break;
 	case NOTIF_USB_PROPERTY:
-		/*
-		 * On X1E80100, a USB property change notification may indicate
-		 * PD renegotiation (e.g. charger replug). Reset the flag so
-		 * the next battery status update re-triggers PD configuration.
-		 */
-		if (battmgr->variant == QCOM_BATTMGR_X1E80100)
-			battmgr->pd_current_set = false;
 		power_supply_changed(battmgr->usb_psy);
 		break;
 	case NOTIF_WLS_PROPERTY:
